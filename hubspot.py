@@ -32,7 +32,9 @@ PROPERTIES = [
     "dealname", "amount", "hs_deal_probability", "dealstage", "pipeline",
     "closedate", "createdate", "dealtype",
     "hs_lastmodifieddate", "hs_is_closed_won",
-    "adc_office", "adc_practice"
+    "adc_office", "adc_practice",
+    "hubspot_team_id", "lead_initiator", "relationship_manager",
+    "proposal_coordinator", "solution_architect", "hs_all_collaborator_owner_ids"
 ]
 
 STAGE_MAP = {
@@ -40,6 +42,9 @@ STAGE_MAP = {
     "appointmentscheduled":  "Appointment Scheduled",
     "qualifiedtobuy":        "Needs Defined",
     "decisionmakerboughtin": "Negotiation",
+    "986684659":             "Lead",
+    "986684658":             "Appointment Scheduled",
+    "986684660":             "Needs Defined",
     "presentationscheduled": "Proposal Sent",
     "contractsent":          "Contract Sent",
     "closedlost":            "Closed Lost",
@@ -136,8 +141,14 @@ def transform_deals(raw_deals, extracted_at):
             "dealname":             props.get("dealname"),
             "pipeline":             props.get("pipeline"),
             "dealtype":             props.get("dealtype"),
-            "adc_office":           props.get("adc_office"),
-            "adc_practice":         props.get("adc_practice"),
+            "adc_office":                    props.get("adc_office"),
+            "adc_practice":                  props.get("adc_practice"),
+            "hubspot_team_id":               props.get("hubspot_team_id"),
+            "lead_initiator":                props.get("lead_initiator"),
+            "relationship_manager":          props.get("relationship_manager"),
+            "proposal_coordinator":          props.get("proposal_coordinator"),
+            "solution_architect":            props.get("solution_architect"),
+            "hs_all_collaborator_owner_ids": props.get("hs_all_collaborator_owner_ids"),
             "amount":               float(props["amount"]) if props.get("amount") else None,
             "probability":          float(props["hs_deal_probability"]) if props.get("hs_deal_probability") else None,
             "hs_is_closed_won":     props.get("hs_is_closed_won") == "true",
@@ -151,6 +162,40 @@ def transform_deals(raw_deals, extracted_at):
     return rows
 
 
+# Fields to compare against last known values in BQ — add any field here to make it trigger an append on change.
+TRACKED_FIELDS = ["deal_stage", "amount", "probability", "closedate"]
+
+
+def get_last_known_values(client, deal_ids):
+    """Return {deal_id: {field: value}} for the most recent row per deal in BQ."""
+    if not deal_ids:
+        return {}
+    ids_list = ", ".join(f"'{id}'" for id in deal_ids)
+    fields = ", ".join(TRACKED_FIELDS)
+    query = f"""
+        SELECT id, {fields}
+        FROM (
+            SELECT id, {fields},
+                   ROW_NUMBER() OVER (PARTITION BY id ORDER BY extracted_at DESC) AS rn
+            FROM `{GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE}`
+            WHERE id IN ({ids_list})
+        )
+        WHERE rn = 1
+    """
+    try:
+        result = client.query(query).result()
+        return {row.id: {field: getattr(row, field) for field in TRACKED_FIELDS} for row in result}
+    except NotFound:
+        return {}
+
+
+def has_relevant_change(row, last_known):
+    """Return True if any tracked field changed compared to the last known BQ values."""
+    if row["id"] not in last_known:
+        return True  # new deal, always append
+    return any(row[field] != last_known[row["id"]][field] for field in TRACKED_FIELDS)
+
+
 def load_to_bigquery(client, rows):
     table_ref = f"{GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
 
@@ -159,8 +204,14 @@ def load_to_bigquery(client, rows):
         bigquery.SchemaField("dealname",             "STRING"),
         bigquery.SchemaField("pipeline",             "STRING"),
         bigquery.SchemaField("dealtype",             "STRING"),
-        bigquery.SchemaField("adc_office",           "STRING"),
-        bigquery.SchemaField("adc_practice",         "STRING"),
+        bigquery.SchemaField("adc_office",                    "STRING"),
+        bigquery.SchemaField("adc_practice",                  "STRING"),
+        bigquery.SchemaField("hubspot_team_id",               "STRING"),
+        bigquery.SchemaField("lead_initiator",                "STRING"),
+        bigquery.SchemaField("relationship_manager",          "STRING"),
+        bigquery.SchemaField("proposal_coordinator",          "STRING"),
+        bigquery.SchemaField("solution_architect",            "STRING"),
+        bigquery.SchemaField("hs_all_collaborator_owner_ids", "STRING"),
         bigquery.SchemaField("amount",               "FLOAT"),
         bigquery.SchemaField("probability",          "FLOAT"),
         bigquery.SchemaField("hs_is_closed_won",     "BOOLEAN"),
@@ -174,6 +225,7 @@ def load_to_bigquery(client, rows):
     job_config = bigquery.LoadJobConfig(
         schema=schema,
         write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+        schema_update_options=[bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION],
     )
 
     job = client.load_table_from_json(rows, table_ref, job_config=job_config)
@@ -208,6 +260,15 @@ def main():
 
     print("\nTransforming data...")
     rows = transform_deals(raw_deals, extracted_at)
+
+    print("\nChecking for relevant changes...")
+    last_known = get_last_known_values(client, [row["id"] for row in rows])
+    rows = [row for row in rows if has_relevant_change(row, last_known)]
+    print(f"{len(rows)} deals with relevant changes (tracked fields: {TRACKED_FIELDS})")
+
+    if not rows:
+        print("No relevant changes since last run.")
+        return
 
     print(f"\nAppending {len(rows)} rows to BigQuery...")
     load_to_bigquery(client, rows)
