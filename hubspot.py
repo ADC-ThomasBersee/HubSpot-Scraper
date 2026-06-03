@@ -11,7 +11,7 @@ import os
 import requests
 from datetime import datetime, timezone
 from dotenv import load_dotenv
-from google.api_core.exceptions import NotFound
+from google.api_core.exceptions import BadRequest, NotFound
 from google.cloud import bigquery
 from google.oauth2 import service_account
 
@@ -29,12 +29,15 @@ MAX_PAGES        = 50
 FIRST_RUN_CUTOFF = datetime(2024, 7, 30, tzinfo=timezone.utc)
 
 PROPERTIES = [
-    "dealname", "amount", "hs_deal_probability", "dealstage", "pipeline",
+    "dealname", "amount", "hs_deal_stage_probability", "dealstage", "pipeline",
     "closedate", "createdate", "dealtype",
     "hs_lastmodifieddate", "hs_is_closed_won",
     "adc_office", "adc_practice",
     "hubspot_team_id", "lead_initiator", "relationship_manager",
-    "proposal_coordinator", "solution_architect", "hs_all_collaborator_owner_ids"
+    "proposal_coordinator", "solution_architect", "hs_all_collaborator_owner_ids",
+    "project_start_date", "project_end_date",
+    "hubspot_owner_id", "project_updated_in_operating_",
+    "amount_in_home_currency", "hs_projected_amount_in_home_currency"
 ]
 
 STAGE_MAP = {
@@ -50,6 +53,7 @@ STAGE_MAP = {
     "closedlost":            "Closed Lost",
     "closedwon":             "Closed Won",
 }
+
 
 
 def get_watermark(client):
@@ -149,8 +153,14 @@ def transform_deals(raw_deals, extracted_at):
             "proposal_coordinator":          props.get("proposal_coordinator"),
             "solution_architect":            props.get("solution_architect"),
             "hs_all_collaborator_owner_ids": props.get("hs_all_collaborator_owner_ids"),
+            "project_start_date":            props.get("project_start_date"),
+            "project_end_date":              props.get("project_end_date"),
+            "hubspot_owner_id":              props.get("hubspot_owner_id"),
+            "project_updated_in_operating_": props.get("project_updated_in_operating_") == "true",
+            "amount_in_home_currency":       float(props["amount_in_home_currency"]) if props.get("amount_in_home_currency") else None,
+            "hs_projected_amount_in_home_currency": float(props["hs_projected_amount_in_home_currency"]) if props.get("hs_projected_amount_in_home_currency") else None,
             "amount":               float(props["amount"]) if props.get("amount") else None,
-            "probability":          float(props["hs_deal_probability"]) if props.get("hs_deal_probability") else None,
+            "probability":          float(props["hs_deal_stage_probability"]) if props.get("hs_deal_stage_probability") else None,
             "hs_is_closed_won":     props.get("hs_is_closed_won") == "true",
             "createdate":           props.get("createdate"),
             "closedate":            props.get("closedate"),
@@ -163,7 +173,9 @@ def transform_deals(raw_deals, extracted_at):
 
 
 # Fields to compare against last known values in BQ — add any field here to make it trigger an append on change.
-TRACKED_FIELDS = ["deal_stage", "amount", "probability", "closedate"]
+TRACKED_FIELDS = ["deal_stage", "amount", "probability", "project_start_date", "project_end_date",
+                  "hubspot_owner_id", "project_updated_in_operating_", "amount_in_home_currency",
+                  "hs_projected_amount_in_home_currency"]
 
 
 def get_last_known_values(client, deal_ids):
@@ -185,15 +197,17 @@ def get_last_known_values(client, deal_ids):
     try:
         result = client.query(query).result()
         return {row.id: {field: getattr(row, field) for field in TRACKED_FIELDS} for row in result}
-    except NotFound:
+    except (NotFound, BadRequest):
         return {}
 
 
-def has_relevant_change(row, last_known):
-    """Return True if any tracked field changed compared to the last known BQ values."""
+def get_changed_fields(row, last_known):
+    """Return list of tracked fields that changed. Empty list means no relevant change."""
     if row["id"] not in last_known:
-        return True  # new deal, always append
-    return any(row[field] != last_known[row["id"]][field] for field in TRACKED_FIELDS)
+        return TRACKED_FIELDS  # new deal — all tracked fields are new
+    def norm(v):
+        return str(v) if v is not None else None
+    return [field for field in TRACKED_FIELDS if norm(row[field]) != norm(last_known[row["id"]][field])]
 
 
 def load_to_bigquery(client, rows):
@@ -212,6 +226,12 @@ def load_to_bigquery(client, rows):
         bigquery.SchemaField("proposal_coordinator",          "STRING"),
         bigquery.SchemaField("solution_architect",            "STRING"),
         bigquery.SchemaField("hs_all_collaborator_owner_ids", "STRING"),
+        bigquery.SchemaField("project_start_date",            "DATE"),
+        bigquery.SchemaField("project_end_date",              "DATE"),
+        bigquery.SchemaField("hubspot_owner_id",              "STRING"),
+        bigquery.SchemaField("project_updated_in_operating_", "BOOLEAN"),
+        bigquery.SchemaField("amount_in_home_currency",       "FLOAT"),
+        bigquery.SchemaField("hs_projected_amount_in_home_currency", "FLOAT"),
         bigquery.SchemaField("amount",               "FLOAT"),
         bigquery.SchemaField("probability",          "FLOAT"),
         bigquery.SchemaField("hs_is_closed_won",     "BOOLEAN"),
@@ -220,6 +240,7 @@ def load_to_bigquery(client, rows):
         bigquery.SchemaField("hs_lastmodifieddate",  "TIMESTAMP"),
         bigquery.SchemaField("deal_stage",           "STRING"),
         bigquery.SchemaField("extracted_at",         "TIMESTAMP"),
+        bigquery.SchemaField("changed_fields",       "STRING"),
     ]
 
     job_config = bigquery.LoadJobConfig(
@@ -263,7 +284,9 @@ def main():
 
     print("\nChecking for relevant changes...")
     last_known = get_last_known_values(client, [row["id"] for row in rows])
-    rows = [row for row in rows if has_relevant_change(row, last_known)]
+    for row in rows:
+        row["changed_fields"] = ", ".join(get_changed_fields(row, last_known))
+    rows = [row for row in rows if row["changed_fields"]]
     print(f"{len(rows)} deals with relevant changes (tracked fields: {TRACKED_FIELDS})")
 
     if not rows:
