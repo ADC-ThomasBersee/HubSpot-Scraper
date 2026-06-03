@@ -56,6 +56,19 @@ STAGE_MAP = {
 
 
 
+def fetch_owners():
+    response = requests.get(
+        "https://api.hubapi.com/crm/v3/owners",
+        headers={"Authorization": f"Bearer {HUBSPOT_TOKEN}"},
+        params={"includeInactive": "true", "limit": "500"}
+    )
+    response.raise_for_status()
+    return {
+        str(o["id"]): f"{o.get('firstName', '')} {o.get('lastName', '')}".strip() or o.get("email", "")
+        for o in response.json().get("results", [])
+    }
+
+
 def get_watermark(client):
     """Return the most recent hs_lastmodifieddate already in BQ, or None on first run."""
     try:
@@ -134,7 +147,15 @@ def fetch_all_deals(filter_groups):
     return all_deals
 
 
-def transform_deals(raw_deals, extracted_at):
+def transform_deals(raw_deals, extracted_at, owner_map):
+    def resolve(owner_id):
+        return owner_map.get(str(owner_id)) if owner_id else None
+
+    def resolve_collaborators(raw):
+        if not raw:
+            return None
+        return "; ".join(owner_map.get(oid.strip(), oid.strip()) for oid in raw.split(";") if oid.strip())
+
     rows = []
     for deal in raw_deals:
         props = deal.get("properties", {})
@@ -149,13 +170,19 @@ def transform_deals(raw_deals, extracted_at):
             "adc_practice":                  props.get("adc_practice"),
             "hubspot_team_id":               props.get("hubspot_team_id"),
             "lead_initiator":                props.get("lead_initiator"),
+            "lead_initiator_name":           resolve(props.get("lead_initiator")),
             "relationship_manager":          props.get("relationship_manager"),
+            "relationship_manager_name":     resolve(props.get("relationship_manager")),
             "proposal_coordinator":          props.get("proposal_coordinator"),
+            "proposal_coordinator_name":     resolve(props.get("proposal_coordinator")),
             "solution_architect":            props.get("solution_architect"),
+            "solution_architect_name":       resolve(props.get("solution_architect")),
             "hs_all_collaborator_owner_ids": props.get("hs_all_collaborator_owner_ids"),
+            "hs_all_collaborator_names":     resolve_collaborators(props.get("hs_all_collaborator_owner_ids")),
             "project_start_date":            props.get("project_start_date"),
             "project_end_date":              props.get("project_end_date"),
             "hubspot_owner_id":              props.get("hubspot_owner_id"),
+            "hubspot_owner_name":            resolve(props.get("hubspot_owner_id")),
             "project_updated_in_operating_": props.get("project_updated_in_operating_") == "true",
             "amount_in_home_currency":       float(props["amount_in_home_currency"]) if props.get("amount_in_home_currency") else None,
             "hs_projected_amount_in_home_currency": float(props["hs_projected_amount_in_home_currency"]) if props.get("hs_projected_amount_in_home_currency") else None,
@@ -222,13 +249,19 @@ def load_to_bigquery(client, rows):
         bigquery.SchemaField("adc_practice",                  "STRING"),
         bigquery.SchemaField("hubspot_team_id",               "STRING"),
         bigquery.SchemaField("lead_initiator",                "STRING"),
+        bigquery.SchemaField("lead_initiator_name",           "STRING"),
         bigquery.SchemaField("relationship_manager",          "STRING"),
+        bigquery.SchemaField("relationship_manager_name",     "STRING"),
         bigquery.SchemaField("proposal_coordinator",          "STRING"),
+        bigquery.SchemaField("proposal_coordinator_name",     "STRING"),
         bigquery.SchemaField("solution_architect",            "STRING"),
+        bigquery.SchemaField("solution_architect_name",       "STRING"),
         bigquery.SchemaField("hs_all_collaborator_owner_ids", "STRING"),
+        bigquery.SchemaField("hs_all_collaborator_names",     "STRING"),
         bigquery.SchemaField("project_start_date",            "DATE"),
         bigquery.SchemaField("project_end_date",              "DATE"),
         bigquery.SchemaField("hubspot_owner_id",              "STRING"),
+        bigquery.SchemaField("hubspot_owner_name",            "STRING"),
         bigquery.SchemaField("project_updated_in_operating_", "BOOLEAN"),
         bigquery.SchemaField("amount_in_home_currency",       "FLOAT"),
         bigquery.SchemaField("hs_projected_amount_in_home_currency", "FLOAT"),
@@ -279,8 +312,12 @@ def main():
         print("No new or updated deals since last run.")
         return
 
+    print("\nFetching owner mapping from HubSpot...")
+    owner_map = fetch_owners()
+    print(f"Loaded {len(owner_map)} owners")
+
     print("\nTransforming data...")
-    rows = transform_deals(raw_deals, extracted_at)
+    rows = transform_deals(raw_deals, extracted_at, owner_map)
 
     print("\nChecking for relevant changes...")
     last_known = get_last_known_values(client, [row["id"] for row in rows])
