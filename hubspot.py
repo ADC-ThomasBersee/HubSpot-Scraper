@@ -13,15 +13,13 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 from google.api_core.exceptions import BadRequest, NotFound
 from google.cloud import bigquery
-from google.oauth2 import service_account
 
 load_dotenv()
 
-HUBSPOT_TOKEN        = os.environ["HUBSPOT_TOKEN"]
-GCP_PROJECT          = os.environ.get("GCP_PROJECT", "reporting-adc")
-BQ_DATASET           = os.environ.get("BQ_DATASET", "hubspot")
-BQ_TABLE             = os.environ.get("BQ_TABLE", "deals_test")
-SERVICE_ACCOUNT_JSON = os.environ["SERVICE_ACCOUNT_JSON"]
+HUBSPOT_TOKEN = os.environ["HUBSPOT_TOKEN"]
+GCP_PROJECT   = os.environ.get("GCP_PROJECT", "reporting-adc")
+BQ_DATASET    = os.environ.get("BQ_DATASET", "hubspot")
+BQ_TABLE      = os.environ.get("BQ_TABLE", "deals")
 
 HUBSPOT_API_URL  = "https://api.hubapi.com/crm/v3/objects/deals/search"
 PAGE_SIZE        = 100
@@ -256,12 +254,17 @@ def load_to_bigquery(client, rows):
     print(f"\nLoaded {len(rows)} new rows — table now has {table.num_rows} total rows in {table_ref}")
 
 
+def hubspot_extract(request):
+    """Cloud Function HTTP entrypoint."""
+    main()
+    return "OK", 200
+
+
 def main():
     extracted_at = datetime.now(timezone.utc).isoformat()
     print(f"Starting extract at {extracted_at}\n")
 
-    credentials = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_JSON)
-    client = bigquery.Client(project=GCP_PROJECT, credentials=credentials)
+    client = bigquery.Client(project=GCP_PROJECT)
 
     watermark = get_watermark(client)
     if watermark:
